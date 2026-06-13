@@ -52,12 +52,13 @@ let DEFAULT_PLAYLIST_ID = +localStorage.getItem("ncm-default-playlist") || 51992
 const LOG_STYLE = "background:#c8ff2e;color:#050505;padding:0 4px;font-weight:700";
 function log(...a) { if (state.debug) console.log("%cNS", LOG_STYLE, ...a); }
 
-/* 所有请求带时间戳防缓存；登录后自动附加 Cookie */
-async function api(path) {
+/* 所有请求带时间戳防缓存；登录后自动附加 Cookie。
+   opts.noCookie：扫码登录等场景跳过 Cookie，避免旧/异站 Cookie 污染会话 */
+async function api(path, opts = {}) {
   const sep = path.includes("?") ? "&" : "?";
   let url = API_BASE + path + sep + "timestamp=" + Date.now();
   const ck = localStorage.getItem("ncm-cookie");
-  if (ck) url += "&cookie=" + encodeURIComponent(ck);
+  if (ck && !opts.noCookie) url += "&cookie=" + encodeURIComponent(ck);
   log("→", path);
   try {
     const res = await fetch(url);
@@ -874,14 +875,16 @@ const auth = {
         const p = d.data?.profile;
         if (p) {
           this.profile = p;
+          log("已登录", p.nickname, p.userId);
           this.refreshLiked();
           /* 登录后版权范围变大：清除不可用标记让其可重试 */
           tracks.forEach((t) => { if (t.type === "cloud") t.unavailable = false; });
           renderQueue();
         } else {
+          log("Cookie 无效，清除");
           localStorage.removeItem("ncm-cookie");
         }
-      } catch (e) { /* API 离线，保留 cookie 下次再试 */ }
+      } catch (e) { log("登录态校验失败（API 离线？）", e.message); /* 保留 cookie 下次再试 */ }
     }
     this.renderChip();
     this.renderAccount();
@@ -914,16 +917,22 @@ const auth = {
 
   async startQR() {
     this.stopQR();
+    /* 全新登录：清除可能残留的旧 Cookie，避免污染本次二维码会话 */
+    localStorage.removeItem("ncm-cookie");
     const box = els.accountBox;
     box.innerHTML = '<div class="qr-state">生成二维码…</div>';
     try {
-      const k = await api("/login/qr/key");
-      const key = k.data.unikey;
-      const q = await api(`/login/qr/create?key=${key}&qrimg=true`);
+      /* 扫码三步均不带 Cookie（unikey 已显式传递） */
+      const k = await api("/login/qr/key", { noCookie: true });
+      const key = k.data?.unikey;
+      if (!key) throw new Error("接口未返回 unikey");
+      const q = await api(`/login/qr/create?key=${key}&qrimg=true`, { noCookie: true });
+      const qrimg = q.data?.qrimg;
+      if (!qrimg) throw new Error("接口未返回二维码图片");
       box.innerHTML = "";
       const img = new Image();
       img.className = "qr";
-      img.src = q.data.qrimg;
+      img.src = qrimg;
       img.title = "点击刷新二维码";
       img.addEventListener("click", () => this.startQR());
       const st = document.createElement("div");
@@ -933,9 +942,13 @@ const auth = {
       hint.className = "hint";
       hint.textContent = "扫码后在手机上确认；二维码过期可点击图片刷新";
       box.append(img, st, hint);
+      log("二维码已生成", key);
+      let errStreak = 0;
       this.qrTimer = setInterval(async () => {
         try {
-          const c = await api(`/login/qr/check?key=${key}`);
+          const c = await api(`/login/qr/check?key=${key}`, { noCookie: true });
+          errStreak = 0;
+          log("二维码状态", c.code, c.message || "");
           if (c.code === 800) {
             this.stopQR();
             st.textContent = "二维码已过期 — 点击图片刷新";
@@ -944,16 +957,36 @@ const auth = {
             st.textContent = "已扫码 — 请在手机上确认";
           } else if (c.code === 803) {
             this.stopQR();
-            localStorage.setItem("ncm-cookie", c.cookie || "");
-            st.textContent = "登录成功";
+            if (!c.cookie) {                       // 远端未把 Cookie 放进响应体
+              st.textContent = "登录失败：接口未返回 Cookie，换个 API 端点重试";
+              log("803 但无 cookie 字段", c);
+              return;
+            }
+            localStorage.setItem("ncm-cookie", c.cookie);
+            st.textContent = "登录成功 ✓ 正在校验…";
+            log("扫码成功，已保存 Cookie");
             await this.init();
             library.renderPlaylists();
-            loadDailyIntoQueue();          // 登录成功 → 队列换成每日推荐
+            if (this.profile) {
+              st.textContent = `登录成功 ✓ ${this.profile.nickname}`;
+              loadDailyIntoQueue();                // 登录成功 → 队列换成每日推荐
+            } else {
+              st.textContent = "已扫码但状态校验失败 — 检查 API 端点 / 服务所在地区";
+            }
           }
-        } catch (e) { /* 单次轮询失败忽略 */ }
+        } catch (e) {
+          /* 连续失败才报错，单次抖动忽略 */
+          if (++errStreak >= 3) {
+            this.stopQR();
+            st.textContent = `轮询失败：${e.message} — 检查 API 端点 / 跨域(CORS)`;
+            log("二维码轮询连续失败", e.message);
+          }
+        }
       }, 2000);
     } catch (e) {
-      box.innerHTML = '<div class="qr-state">无法连接 API 服务</div>';
+      box.innerHTML = `<div class="qr-state">无法连接 API：${e.message}</div>` +
+        `<div class="hint">请在「设置」中确认 API 端点可访问且允许跨域（CORS）</div>`;
+      log("二维码生成失败", e.message);
     }
   },
 
@@ -1379,12 +1412,20 @@ const settings = {
     API_BASE = v;
     localStorage.setItem("ncm-api", v);
     els.setApi.value = v;
-    log("API 端点 →", v);
+    /* 切换服务端 = 全新环境：旧 Cookie 属于旧服务/旧会话，必须清除并回到未登录态，
+       否则会被附加到新端点的每个请求上，导致登录态校验与扫码异常 */
+    localStorage.removeItem("ncm-cookie");
+    auth.profile = null;
+    likedIds = new Set();
+    auth.renderChip();
+    updateLikeUI();
+    log("API 端点 →", v, "（已清除旧 Cookie，回到未登录态）");
     this.status("RECONNECTING…");
     setCloudState("RECONNECTING…");
     await auth.init();
     await bootQueue();
-    this.status("已切换 API 端点并重连");
+    auth.renderAccount();
+    this.status("已切换 API 端点（如需账号功能请重新扫码登录）");
   },
 
   applyPlaylist() {
